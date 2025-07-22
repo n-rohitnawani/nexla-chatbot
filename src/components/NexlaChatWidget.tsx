@@ -44,12 +44,12 @@ export default function NexlaChatWidget() {
       const response = await fetch('https://api-genai.nexla.io/query', {
         method: 'POST',
         headers: {
-          'Authorization': 'Bearer 953db54407ab4efeb4eab01926f41855',
+          'Authorization': 'Bearer <API KEY>',
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
           user_query: query,
-          datasets: [{ id: '341463' }],
+          datasets: [{ id: <DATASET_ID> }],
           ai_model: 'gpt-4o',
           llm_provider: 'openai',
           streaming: false
