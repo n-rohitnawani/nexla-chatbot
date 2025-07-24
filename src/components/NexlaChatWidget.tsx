@@ -26,68 +26,163 @@ export default function NexlaChatWidget() {
   const [open, setOpen] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Chat sessions state
-  const [chatSessions, setChatSessions] = useState<ChatSession[]>([{
-    id: String(Date.now()),
-    created: Date.now(),
-    messages: [],
-  }]);
-  const [currentSessionIdx, setCurrentSessionIdx] = useState(0);
+  // Track if localStorage is available
+  const [storageAvailable, setStorageAvailable] = useState(true);
+
+  // Track the current fetch controller for cancellation
+  const fetchControllerRef = useRef<AbortController | null>(null);
+
+  // Chat sessions state with robust fallback
+  const [chatSessions, setChatSessions] = useState<ChatSession[]>(() => {
+    try {
+      const stored = localStorage.getItem('nexla_chat_sessions');
+      if (stored) {
+        return JSON.parse(stored);
+      }
+    } catch {
+      // localStorage not available, fallback to in-memory
+      setStorageAvailable(false);
+    }
+    return [{
+      id: String(Date.now()),
+      created: Date.now(),
+      messages: [],
+    }];
+  });
+  // Persist currentSessionIdx in localStorage
+  const [currentSessionIdx, setCurrentSessionIdx] = useState(() => {
+    try {
+      const storedIdx = localStorage.getItem('nexla_current_session_idx');
+      if (storedIdx !== null) {
+        return parseInt(storedIdx, 10);
+      }
+    } catch {}
+    return 0;
+  });
   const [showHistory, setShowHistory] = useState(false);
+
+  // Save chatSessions to localStorage whenever it changes, if available
+  useEffect(() => {
+    if (!storageAvailable) return;
+    try {
+      localStorage.setItem('nexla_chat_sessions', JSON.stringify(chatSessions));
+    } catch {
+      setStorageAvailable(false);
+    }
+  }, [chatSessions, storageAvailable]);
+
+  // Save currentSessionIdx to localStorage whenever it changes
+  useEffect(() => {
+    if (!storageAvailable) return;
+    try {
+      localStorage.setItem('nexla_current_session_idx', String(currentSessionIdx));
+    } catch {}
+  }, [currentSessionIdx, storageAvailable]);
 
   // Mock search function (now acts as chat send)
   const performSearch = async (query: string) => {
     setIsSearching(true);
     setShowResult(true);
 
+    // Add page context to the user query
+    const pageUrl = window.location.href;
+    const userQueryWithContext = `${query}. CONTEXT: User is on this page, use this as a context: ${pageUrl}`;
+
+    // Add a new message with empty answer to start streaming
+    setChatSessions((prev) => {
+      const updated = [...prev];
+      updated[currentSessionIdx] = {
+        ...updated[currentSessionIdx],
+        messages: [
+          ...updated[currentSessionIdx].messages,
+          { question: query, answer: '' },
+        ],
+      };
+      return updated;
+    });
+
+    // Abort any previous fetch
+    if (fetchControllerRef.current) {
+      fetchControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    fetchControllerRef.current = controller;
+
     try {
       const response = await fetch('https://api-genai.nexla.io/query', {
         method: 'POST',
         headers: {
-          'Authorization': 'Bearer <API KEY>',
+          'Authorization': 'Bearer 6cc2968ce32940f5824d05b551c820ee',
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          user_query: query,
-          datasets: [{ id: <DATASET_ID> }],
+          user_query: userQueryWithContext,
+          datasets: [{ id: '341463' }],
           ai_model: 'gpt-4o',
           llm_provider: 'openai',
-          streaming: false
+          streaming: true
         }),
+        signal: controller.signal,
       });
 
-      const data = await response.json();
-      // Try to get the answer from the response, fallback to stringified data
-      const answer = data.answer || data.result || JSON.stringify(data);
+      if (!response.body) throw new Error('No response body for streaming');
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let done = false;
+      let answer = '';
 
-      setChatSessions((prev) => {
-        const updated = [...prev];
-        updated[currentSessionIdx] = {
-          ...updated[currentSessionIdx],
-          messages: [
-            ...updated[currentSessionIdx].messages,
-            { question: query, answer },
-          ],
-        };
-        return updated;
-      });
+      while (!done) {
+        const { value, done: doneReading } = await reader.read();
+        done = doneReading;
+        if (value) {
+          answer += decoder.decode(value, { stream: !done });
+          // Update the last message's answer as we stream
+          setChatSessions((prev) => {
+            const updated = [...prev];
+            const msgs = updated[currentSessionIdx].messages;
+            updated[currentSessionIdx] = {
+              ...updated[currentSessionIdx],
+              messages: [
+                ...msgs.slice(0, msgs.length - 1),
+                { ...msgs[msgs.length - 1], answer },
+              ],
+            };
+            return updated;
+          });
+        }
+      }
     } catch (error) {
-      setChatSessions((prev) => {
-        const updated = [...prev];
-        updated[currentSessionIdx] = {
-          ...updated[currentSessionIdx],
-          messages: [
-            ...updated[currentSessionIdx].messages,
-            { question: query, answer: 'Error: ' + (error instanceof Error ? error.message : String(error)) },
-          ],
-        };
-        return updated;
-      });
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        // Fetch was aborted, do not update chat
+      } else {
+        setChatSessions((prev) => {
+          const updated = [...prev];
+          const msgs = updated[currentSessionIdx].messages;
+          updated[currentSessionIdx] = {
+            ...updated[currentSessionIdx],
+            messages: [
+              ...msgs.slice(0, msgs.length - 1),
+              { ...msgs[msgs.length - 1], answer: 'Error: ' + (error instanceof Error ? error.message : String(error)) },
+            ],
+          };
+          return updated;
+        });
+      }
     }
 
     setIsSearching(false);
     setInput('');
+    fetchControllerRef.current = null;
   };
+
+  // Abort fetch if component unmounts (e.g., page navigation)
+  useEffect(() => {
+    return () => {
+      if (fetchControllerRef.current) {
+        fetchControllerRef.current.abort();
+      }
+    };
+  }, []);
 
   // Focus input on mount
   useEffect(() => {
@@ -161,18 +256,22 @@ export default function NexlaChatWidget() {
         </div>
       )}
       {/* Backdrop when result is open */}
-      {showResult && (
-        <div
-          style={{
-            position: 'fixed',
-            inset: 0,
-            background: 'rgba(0,0,0,0.18)',
-            backdropFilter: 'blur(2px)',
-            zIndex: 40,
-            transition: 'all 0.3s',
-          }}
-          onClick={() => setShowResult(false)}
-        />
+      {showResult && !storageAvailable && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          width: '100vw',
+          zIndex: 200,
+          background: 'rgba(255,255,0,0.95)',
+          color: '#232336',
+          fontWeight: 700,
+          fontSize: 16,
+          padding: '12px 0',
+          textAlign: 'center',
+        }}>
+          Chat history will not persist after reload (localStorage unavailable)
+        </div>
       )}
       {/* Answer/Result Panel (now shows chat history) */}
       {open && showResult && (
@@ -181,7 +280,7 @@ export default function NexlaChatWidget() {
             position: 'fixed',
             left: '50%',
             transform: 'translateX(-50%)',
-            bottom: 80,
+            bottom: 100, // Reduced space between result panel and search bar
             zIndex: 50,
             width: '60vw',
             maxWidth: 900,
@@ -204,7 +303,17 @@ export default function NexlaChatWidget() {
               <span style={{ fontWeight: 800, fontSize: 22, letterSpacing: '-1px' }}>Hey Nexla!</span>
             </div>
             <button
-              onClick={() => { setShowResult(false); setOpen(false); }}
+              onClick={() => { 
+                setShowResult(false); 
+                setOpen(false); 
+                setShowHistory(false);
+                // Reset search state and abort any ongoing fetch
+                setIsSearching(false);
+                if (fetchControllerRef.current) {
+                  fetchControllerRef.current.abort();
+                  fetchControllerRef.current = null;
+                }
+              }}
               style={{ background: 'rgba(255,255,255,0.12)', border: 'none', borderRadius: '50%', width: 36, height: 36, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', transition: 'background 0.15s', marginLeft: 8, padding: 0 }}
               aria-label="Close results"
             >
@@ -213,99 +322,127 @@ export default function NexlaChatWidget() {
           </div>
           {/* Main Content */}
           <div style={{ flex: 1, overflowY: 'auto', background: '#F9F9FF', padding: '38px 48px 32px 48px', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-            {/* Show latest Q/A only, styled as in screenshot */}
-            {isSearching ? (
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 40 }}>
+            {/* Show all Q&A pairs in the current session */}
+            {chatSessions[currentSessionIdx]?.messages.map((msg, idx) => {
+              let answerText = msg.answer;
+              let relatedQuestions: string[] = [];
+              let citations: string[] = [];
+              // Extract and remove 'Source Citation:' block (plain text, not markdown links)
+              const citationBlockMatch = answerText.match(/Source Citation:\s*([\s\S]*?)(\n\n|$)/i);
+              if (citationBlockMatch) {
+                answerText = answerText.replace(citationBlockMatch[0], '').trim();
+                citations = citationBlockMatch[1]
+                  .split('\n')
+                  .map(line => line.trim())
+                  .filter(line => line.length > 0);
+              }
+              // Extract all markdown links from the answer (not just from 'Source')
+              const allLinks: { label: string; url: string }[] = [];
+              answerText = answerText.replace(/\[([^\]]+)\]\(([^\)]+)\)/g, (_, label, url) => {
+                allLinks.push({ label, url });
+                return '';
+              });
+              // Extract markdown links from each citation line, ignore trailing text
+              citations.forEach(line => {
+                const match = line.match(/\[([^\]]+)\]\(([^\)]+)\)/);
+                if (match) {
+                  allLinks.push({ label: match[1], url: match[2] });
+                }
+              });
+              // Remove markdown links from citation lines so they don't show as text
+              citations = citations.map(line => line.replace(/\[([^\]]+)\]\(([^\)]+)\)/, '').trim()).filter(line => line.length > 0);
+              // Remove legacy 'Source:' section if present
+              const sourceMatch = answerText.match(/Source:\s*((\[[^\]]+\]\([^\)]+\),?\s*)+)/i);
+              if (sourceMatch) {
+                answerText = answerText.replace(sourceMatch[0], '').trim();
+              }
+              const relatedMatch = answerText.match(/Related Questions:\s*((?:- .+\n?)+)/i);
+              if (relatedMatch) {
+                answerText = answerText.replace(relatedMatch[0], '').trim();
+                relatedQuestions = relatedMatch[1]
+                  .split('\n')
+                  .map(q => q.replace(/^\-\s*/, '').trim())
+                  .filter(q => q.length > 0);
+              }
+              return (
+                <div key={idx} style={{ width: '100%', marginBottom: 32 }}>
+                  {/* Main Question */}
+                  <div style={{ fontWeight: 800, fontSize: 32, color: '#232336', marginBottom: 18, width: '100%', textAlign: 'left', lineHeight: 1.2 }}>
+                    <span style={{ background: '#E7E5F7', borderRadius: 8, padding: '0 8px' }}> {msg.question} </span>
+                  </div>
+                  {/* Main Answer */}
+                  <div style={{ fontSize: 18, color: '#232336', marginBottom: 24, width: '100%', textAlign: 'left', lineHeight: 1.6 }}>
+                    <ReactMarkdown>{answerText}</ReactMarkdown>
+                  </div>
+                  {/* Action Buttons (above sources) */}
+                  <div style={{ display: 'flex', gap: 14, marginBottom: 24 }}>
+                    <button style={{ background: 'linear-gradient(90deg, #6154FF 0%, #A084FF 100%)', color: '#fff', borderRadius: 10, border: 'none', padding: '10px 22px', fontWeight: 700, fontSize: 16, boxShadow: '0 2px 8px rgba(97,84,255,0.10)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8 }}>
+                      Schedule a Demo <span style={{ fontSize: 18, marginLeft: 4 }}>→</span>
+                    </button>
+                    <button style={{ background: '#fff', color: NEXLA_PURPLE, borderRadius: 10, border: `2px solid ${NEXLA_PURPLE}`, padding: '10px 22px', fontWeight: 700, fontSize: 16, boxShadow: '0 2px 8px rgba(97,84,255,0.10)', cursor: 'pointer' }}>Let's Talk Now</button>
+                  </div>
+                  {/* You May Be Interested In section (all links as buttons) */}
+                  {allLinks.length > 0 && (
+                    <div style={{ width: '100%', marginBottom: 24, display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                      <div style={{ fontWeight: 700, fontSize: 24, color: '#232336', marginBottom: 18, textAlign: 'center', width: '100%' }}>You May Be Interested In</div>
+                      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', justifyContent: 'flex-start', width: '100%' }}>
+                        {allLinks.map((src, i) => (
+                          <a key={src.label + i} href={src.url} target="_blank" rel="noopener noreferrer" style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: 7,
+                            background: 'linear-gradient(90deg, #B388FF 0%, #F2A1FF 100%)',
+                            color: '#fff',
+                            borderRadius: 8,
+                            padding: '7px 16px',
+                            fontWeight: 700,
+                            fontSize: 15,
+                            cursor: 'pointer',
+                            textDecoration: 'none',
+                            border: 'none',
+                            transition: 'background 0.15s',
+                          }}>
+                            <span style={{ fontSize: 17 }}>🔗</span> {src.label}
+                          </a>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {/* Related Questions (dynamic) */}
+                  {relatedQuestions.length > 0 && (
+                    <div style={{ width: '100%', background: '#F2F1FF', border: `1.5px dashed ${NEXLA_PURPLE}`, borderRadius: 18, padding: '24px 24px 12px 24px', marginBottom: 8 }}>
+                      <div style={{ fontWeight: 700, fontSize: 20, color: '#232336', marginBottom: 18, textAlign: 'left' }}>Related Questions</div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                        {relatedQuestions.map((q, i) => (
+                          <div
+                            key={q}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                              fontSize: 16,
+                              color: '#232336',
+                              cursor: 'pointer',
+                              padding: '8px 0',
+                              borderBottom: i !== relatedQuestions.length - 1 ? '1px solid #E7E5F7' : 'none',
+                            }}
+                            onClick={() => performSearch(q)}
+                          >
+                            <span>{q}</span>
+                            <span style={{ color: NEXLA_PURPLE, fontSize: 18, marginLeft: 8 }}>↗</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            {/* If searching, show loading at the end */}
+            {isSearching && (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 40, width: '100%' }}>
                 <Sparkles size={28} color={NEXLA_PURPLE} />
                 <span style={{ marginLeft: 16, color: NEXLA_PURPLE, fontWeight: 600, fontSize: 18 }}>AI is searching Nexla knowledge base...</span>
-              </div>
-            ) : chatSessions[currentSessionIdx]?.messages.length > 0 ? (
-              (() => {
-                const lastMsg = chatSessions[currentSessionIdx].messages[chatSessions[currentSessionIdx].messages.length - 1];
-                // Parse answer for 'Source' links
-                let answerText = lastMsg.answer;
-                let sources: { label: string; url: string }[] = [];
-                let relatedQuestions: string[] = [];
-                const sourceMatch = answerText.match(/Source:\s*((\[[^\]]+\]\([^\)]+\),?\s*)+)/i);
-                if (sourceMatch) {
-                  answerText = answerText.replace(sourceMatch[0], '').trim();
-                  const linkRegex = /\[([^\]]+)\]\(([^\)]+)\)/g;
-                  let m;
-                  while ((m = linkRegex.exec(sourceMatch[1])) !== null) {
-                    sources.push({ label: m[1], url: m[2] });
-                  }
-                }
-                // Parse for Related Questions section
-                const relatedMatch = answerText.match(/Related Questions:\s*((?:- .+\n?)+)/i);
-                if (relatedMatch) {
-                  // Remove the Related Questions section from the answer
-                  answerText = answerText.replace(relatedMatch[0], '').trim();
-                  // Extract each question after '- '
-                  relatedQuestions = relatedMatch[1]
-                    .split('\n')
-                    .map(q => q.replace(/^-\s*/, '').trim())
-                    .filter(q => q.length > 0);
-                }
-                return (
-                  <>
-                    {/* Main Question */}
-                    <div style={{ fontWeight: 800, fontSize: 32, color: '#232336', marginBottom: 18, width: '100%', textAlign: 'left', lineHeight: 1.2 }}>
-                      <span style={{ background: '#E7E5F7', borderRadius: 8, padding: '0 8px' }}> {lastMsg.question} </span>
-                    </div>
-                    {/* Main Answer */}
-                    <div style={{ fontSize: 18, color: '#232336', marginBottom: 24, width: '100%', textAlign: 'left', lineHeight: 1.6 }}>
-                      <ReactMarkdown>{answerText}</ReactMarkdown>
-                    </div>
-                    {/* Action Buttons */}
-                    <div style={{ display: 'flex', gap: 18, marginBottom: 32 }}>
-                      <button style={{ background: NEXLA_PURPLE, color: '#fff', borderRadius: 12, border: 'none', padding: '16px 32px', fontWeight: 700, fontSize: 18, boxShadow: '0 2px 8px rgba(97,84,255,0.10)', cursor: 'pointer' }}>Schedule a Demo →</button>
-                      <button style={{ background: '#fff', color: NEXLA_PURPLE, borderRadius: 12, border: `2px solid ${NEXLA_PURPLE}`, padding: '16px 32px', fontWeight: 700, fontSize: 18, boxShadow: '0 2px 8px rgba(97,84,255,0.10)', cursor: 'pointer' }}>Let's Talk Now</button>
-                    </div>
-                    {/* Suggestions from Source links */}
-                    {sources.length > 0 && (
-                      <div style={{ width: '100%', marginBottom: 32, display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-                        <div style={{ fontWeight: 700, fontSize: 20, color: '#232336', marginBottom: 12, textAlign: 'center', width: '100%' }}>You May Be Interested In</div>
-                        <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', justifyContent: 'center' }}>
-                          {sources.map((src, i) => (
-                            <a key={i} href={src.url} target="_blank" rel="noopener noreferrer" style={{ background: '#E7E5F7', color: NEXLA_PURPLE, borderRadius: 16, padding: '8px 18px', fontWeight: 700, fontSize: 15, cursor: 'pointer', textDecoration: 'none', transition: 'background 0.15s' }}>{src.label}</a>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                    {/* Related Questions (dynamic) */}
-                    {relatedQuestions.length > 0 && (
-                      <div style={{ width: '100%', background: '#F2F1FF', border: `1.5px dashed ${NEXLA_PURPLE}`, borderRadius: 18, padding: '24px 24px 12px 24px', marginBottom: 8 }}>
-                        <div style={{ fontWeight: 700, fontSize: 20, color: '#232336', marginBottom: 18, textAlign: 'left' }}>Related Questions</div>
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                          {relatedQuestions.map((q, i) => (
-                            <div
-                              key={q}
-                              style={{
-                                display: 'flex',
-                                alignItems: 'center',
-                                justifyContent: 'space-between',
-                                fontSize: 16,
-                                color: '#232336',
-                                cursor: 'pointer',
-                                padding: '8px 0',
-                                borderBottom: i !== relatedQuestions.length - 1 ? '1px solid #E7E5F7' : 'none',
-                              }}
-                              onClick={() => performSearch(q)}
-                            >
-                              <span>{q}</span>
-                              <span style={{ color: NEXLA_PURPLE, fontSize: 18, marginLeft: 8 }}>↗</span>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </>
-                );
-              })()
-            ) : (
-              <div style={{ padding: 40, textAlign: 'center', color: '#9CA3AF', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-                <div style={{ marginBottom: 8, fontWeight: 700, fontSize: 20 }}>No messages yet</div>
-                <div style={{ fontSize: 16, color: '#A0A3B1' }}>Start the conversation by asking a question!</div>
               </div>
             )}
           </div>
@@ -360,7 +497,10 @@ export default function NexlaChatWidget() {
           onKeyDown={e => {
             if (e.key === 'Enter') {
               e.preventDefault();
-              if (input.trim()) performSearch(input.trim());
+              if (input.trim()) {
+                setInput(''); // Clear input immediately
+                performSearch(input.trim());
+              }
             }
           }}
         />
@@ -379,11 +519,13 @@ export default function NexlaChatWidget() {
             justifyContent: 'center',
             marginRight: 6,
             marginLeft: 2,
-            cursor: 'pointer',
+            cursor: isSearching ? 'not-allowed' : 'pointer',
             transition: 'background 0.18s',
             outline: 'none',
             padding: 0,
+            opacity: isSearching ? 0.5 : 1,
           }}
+          disabled={isSearching}
         >
           <Mic size={22} color={NEXLA_PURPLE} />
         </button>
@@ -393,7 +535,10 @@ export default function NexlaChatWidget() {
           aria-label="Send"
           onClick={e => {
             e.preventDefault();
-            if (input.trim()) performSearch(input.trim());
+            if (input.trim()) {
+              setInput(''); // Clear input immediately
+              performSearch(input.trim());
+            }
           }}
           style={{
             background: input.trim() ? NEXLA_PURPLE : BUTTON_BG,
@@ -407,16 +552,16 @@ export default function NexlaChatWidget() {
             justifyContent: 'center',
             fontSize: 22,
             fontWeight: 900,
-            cursor: input.trim() ? 'pointer' : 'not-allowed',
+            cursor: input.trim() && !isSearching ? 'pointer' : 'not-allowed',
             marginRight: 4,
             marginLeft: 2,
             boxShadow: 'none',
             transition: 'background 0.18s, color 0.18s',
             outline: 'none',
             padding: 0,
-            opacity: input.trim() ? 1 : 0.6,
+            opacity: input.trim() && !isSearching ? 1 : 0.6,
           }}
-          disabled={!input.trim()}
+          disabled={!input.trim() || isSearching}
         >
           <Send size={22} color={input.trim() ? '#fff' : NEXLA_PURPLE} />
         </button>
@@ -436,11 +581,13 @@ export default function NexlaChatWidget() {
             justifyContent: 'center',
             marginRight: 4,
             marginLeft: 2,
-            cursor: 'pointer',
+            cursor: isSearching ? 'not-allowed' : 'pointer',
             transition: 'background 0.18s',
             outline: 'none',
             padding: 0,
+            opacity: isSearching ? 0.5 : 1,
           }}
+          disabled={isSearching}
         >
           <History size={20} color={NEXLA_PURPLE} />
         </button>
@@ -466,21 +613,33 @@ export default function NexlaChatWidget() {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            marginRight: 10,
+            marginRight: 4,
             marginLeft: 2,
-            cursor: 'pointer',
+            cursor: isSearching ? 'not-allowed' : 'pointer',
             transition: 'background 0.18s',
             outline: 'none',
             padding: 0,
+            opacity: isSearching ? 0.5 : 1,
           }}
+          disabled={isSearching}
         >
           <Plus size={20} color={NEXLA_PURPLE} />
         </button>
-        {/* Close Button (outside, right) */}
+        {/* Close Button (now inside search bar, next to new chat) */}
         {showResult && (
           <button
             aria-label="Close answer"
-            onClick={() => { setShowResult(false); setOpen(false); }}
+            onClick={() => { 
+              setShowResult(false); 
+              setOpen(false); 
+              setShowHistory(false);
+              // Reset search state and abort any ongoing fetch
+              setIsSearching(false);
+              if (fetchControllerRef.current) {
+                fetchControllerRef.current.abort();
+                fetchControllerRef.current = null;
+              }
+            }}
             style={{
               background: BUTTON_BG,
               border: 'none',
@@ -495,12 +654,9 @@ export default function NexlaChatWidget() {
               justifyContent: 'center',
               boxShadow: 'none',
               transition: 'background 0.15s',
-              position: 'absolute',
-              right: -44,
-              top: '50%',
-              transform: 'translateY(-50%)',
+              marginRight: 10,
+              marginLeft: 2,
               outline: 'none',
-              margin: 0,
               padding: 0,
             }}
             onMouseOver={e => (e.currentTarget.style.background = NEXLA_BG)}
